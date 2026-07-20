@@ -1,73 +1,289 @@
 name: Create Specification Document
 
-# The workflow is triggered by pull request, push to main, and manual dispatch.
+# The workflow is triggered by pull request, version tags (BRS spec lineage
+# only -- the Test Spec has no tag lineage of its own, see Makefile), and
+# manual dispatch.
+#
+# Two independently-versioned documents live in this repo (see Makefile):
+# the BRS spec (VERSION_brs, tag-driven) and the BRS Test Specification
+# (VERSION_brs-ts, static/manual). This workflow resolves the BRS spec's
+# release metadata the same way docs-spec-template does (phase gates, tag
+# pushes, milestone floors) and builds the Test Spec alongside it with
+# whatever VERSION_brs-ts the Makefile currently defaults to (or an explicit
+# override input below) -- it is never inferred from a tag.
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Release version, e.g. X.Y.Z:'
-        required: true
-        type: string
-      revision_mark: 
-          description: 'Set revision mark as Draft, Release or Stable:'
-          required: true
-          type: string
-          default: 'Draft'
-      prerelease:
-        description: 'Tag as a pre-release?'
+      release_version:
+        description: Override BRS spec version (e.g., v0.8.2). Milestone floors become official releases.
         required: false
-        type: boolean
-        default: true
+        type: string
+      target_phase:
+        description: Pick a milestone floor for the BRS spec (recommended for official releases).
+        required: false
+        type: choice
+        default: auto-next
+        options:
+          - auto-next
+          - draft-and-development
+          - development-complete
+          - stabilized
+          - frozen
+          - ratification-ready
+          - publication
+          - ratified
+      ts_version:
+        description: Override BRS Test Specification version (e.g., v0.2.0). Leave blank to use the Makefile default.
+        required: false
+        type: string
       draft:
-        description: 'Create release as a draft?'
+        description: Create release as a draft?
         required: false
         type: boolean
         default: false
   pull_request:
   push:
-    branches:
-      - main
+    tags:
+      - v*
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Expose the resolved BRS spec version/date so the stamp-site-version job
+    # can keep antora.yml (the HTML site version) in exact lockstep with this
+    # PDF build. The Test Spec has no Antora component, so nothing of its is
+    # exposed here.
+    outputs:
+      version: ${{ steps.set_build_version.outputs.version }}
+      date: ${{ steps.set_build_version.outputs.date }}
+
     steps:
-    # Step 1: Checkout the repository
-    - name: Checkout repository
-      uses: actions/checkout@v6
-      with:
-        submodules: 'recursive'
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
-    # Step 2: Pull the latest RISC-V Docs container image
-    - name: Pull Container
-      run: docker pull riscvintl/riscv-docs-base-container-image:latest
+      - name: Pull Container
+        run: docker pull ghcr.io/riscv/riscv-docs-base-container-image:latest
 
-    # Step 3: Build Files
-    - name: Build Files
-      run: make
-      env:
-        VERSION: v${{ github.event.inputs.version }}
-        REVMARK: ${{ github.event.inputs.revision_mark }}
+      # Set VERSION_brs for both the PDF build and the release/stamp logic
+      # below. Tag pushes use the exact tag; PR builds compute next patch.
+      # Manual builds support explicit version, milestone floor, or auto
+      # behavior. This resolves ONLY the BRS spec's version -- the Test Spec's
+      # VERSION_brs-ts is independent (see job env below).
+      - name: Set build version
+        id: set_build_version
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.release_version }}" ]; then
+            version="${{ github.event.inputs.release_version }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.target_phase }}" != "auto-next" ]; then
+            version="$(./scripts/release-info.sh phase-floor-version "${{ github.event.inputs.target_phase }}")"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${{ github.ref_name }}"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            latest="$(./scripts/release-info.sh version)"
+            latest_phase="$(./scripts/release-info.sh phase "$latest")"
+            latest_floor="$(./scripts/release-info.sh phase-floor-version "$latest_phase")"
+            if [ "$latest" != "v0.0.0" ] && [ "$latest" != "$latest_floor" ]; then
+              # If current tag is between milestone floors, rebuild/re-release current latest tag.
+              version="$latest"
+            else
+              version="$(./scripts/release-info.sh next "$latest")"
+            fi
+          else
+            latest="$(./scripts/release-info.sh version)"
+            version="$(./scripts/release-info.sh next "$latest")"
+          fi
+          case "$version" in
+            v*) ;;
+            *) version="v$version" ;;
+          esac
+          # Resolve the build date ONCE so both PDFs and the Antora version
+          # stamp share it exactly (no midnight-boundary drift between steps).
+          date="$(date +%Y-%m-%d)"
+          echo "VERSION_brs=$version" >> "$GITHUB_ENV"
+          echo "DATE=$date" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "date=$date" >> "$GITHUB_OUTPUT"
 
-    # Step 4: Upload the built PDF files as a single artifact
-    - name: Upload Build Artifacts
-      uses: actions/upload-artifact@v6
-      with:
-        name: Build Artifacts
-        path: ${{ github.workspace }}/*.pdf
-        retention-days: 30
-      
-    # Create Release
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: ${{ github.workspace }}/*.pdf
-        tag_name: v${{ github.event.inputs.version }}
-        name: Release ${{ github.event.inputs.version }}
-        draft: ${{ github.event.inputs.draft }}
-        prerelease: ${{ github.event.inputs.prerelease }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GHTOKEN }}
-      if: github.event_name == 'workflow_dispatch' 
-      # This condition ensures this step only runs for workflow_dispatch events.
+      - name: Classify release type
+        run: |
+          set -euo pipefail
+          # Milestone-gate tags get a non-prerelease GitHub Release.
+          # v0.99.1 is the entry into publication, so it is also considered official.
+          case "${VERSION_brs}" in
+            v0.6.0|v0.8.0|v0.9.0|v0.99.0|v0.99.1|v1.0.0)
+              echo "OFFICIAL_RELEASE=true" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "OFFICIAL_RELEASE=false" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      # Build both documents. VERSION_brs/DATE are exported so the Makefile
+      # and release-info.sh produce ARC-compliant PDF names for the BRS spec:
+      # BRS-v<ver>-<YYYYMMDD>.pdf. VERSION_brs-ts is passed through only if the
+      # dispatch input overrode it; otherwise the Makefile's static default
+      # applies -- it is never derived from a tag.
+      - name: Build Files
+        run: |
+          set -euo pipefail
+          echo "Building BRS ${VERSION_brs} (${DATE})"
+          make VERSION_brs="${VERSION_brs}" DATE="${DATE}" ${{ github.event.inputs.ts_version && format('VERSION_brs-ts={0}', github.event.inputs.ts_version) || '' }}
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: Build Artifacts
+          path: ${{ github.workspace }}/build/*.pdf
+          retention-days: 30
+
+      # Create official release for version tag pushes
+      - name: Create Release (Tag Push, Official)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/build/*.pdf
+          tag_name: ${{ env.VERSION_brs }}
+          name: Release ${{ env.VERSION_brs }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+        if: github.event_name == 'push' && github.ref_type == 'tag' && env.OFFICIAL_RELEASE == 'true'
+
+      # Create prerelease for non-milestone version tag pushes
+      - name: Create Release (Tag Push, Pre-release)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/build/*.pdf
+          tag_name: ${{ env.VERSION_brs }}
+          name: Release ${{ env.VERSION_brs }}
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+        if: github.event_name == 'push' && github.ref_type == 'tag' && env.OFFICIAL_RELEASE != 'true'
+
+      # Create manual release for milestone versions
+      - name: Create Release (Manual, Official)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/build/*.pdf
+          tag_name: ${{ env.VERSION_brs }}
+          name: Release ${{ env.VERSION_brs }}
+          draft: ${{ github.event.inputs.draft }}
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+        if: github.event_name == 'workflow_dispatch' && env.OFFICIAL_RELEASE == 'true'
+
+      # Create manual prerelease for non-milestone versions
+      - name: Create Release (Manual, Pre-release)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.workspace }}/build/*.pdf
+          tag_name: ${{ env.VERSION_brs }}
+          name: Release ${{ env.VERSION_brs }}
+          draft: ${{ github.event.inputs.draft }}
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+        if: github.event_name == 'workflow_dispatch' && env.OFFICIAL_RELEASE != 'true'
+
+  # Keep the Antora HTML site version in EXACT lockstep with the BRS spec PDF
+  # this run just built: stamp the SAME resolved version/date into antora.yml
+  # on main. The Test Spec has no Antora component, so it is not part of this
+  # job.
+  #
+  # Runs only for real releases: not PR previews (nothing to publish) and not
+  # drafts (not public yet). Never moves main's version backwards, so
+  # rebuilding an older tag will not regress the site.
+  #
+  # The stamp lands as a REVIEW PR, not a direct push to `main`. This template
+  # is seeded into many spec repos whose branch protection we do not control,
+  # and a rejected push would leave the release green while the site version
+  # silently lagged the PDF -- the exact divergence this job exists to
+  # prevent. Opening a PR works under any protection setting. Cost: a
+  # maintainer must merge it for the site to catch up, so treat that merge as
+  # part of cutting a BRS spec release.
+  stamp-site-version:
+    needs: build
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.event.inputs.draft != 'true'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Stamp antora.yml to match the released PDF version
+        id: stamp
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          DATE: ${{ needs.build.outputs.date }}
+        run: |
+          set -euo pipefail
+
+          current="$(grep -E '^version:' antora.yml | awk '{print $2}')"
+          echo "main antora.yml version: ${current:-<none>}; released version: $VERSION"
+
+          # Monotonic guard: never stamp main backwards (e.g. when an old tag is
+          # rebuilt). Skip if main is already at a version >= this release.
+          if [ -n "$current" ] && [ "$current" != "~" ] && [ "$current" != "$VERSION" ]; then
+            highest="$(printf '%s\n%s\n' "${current#v}" "${VERSION#v}" | sort -V | tail -n1)"
+            if [ "$highest" = "${current#v}" ]; then
+              echo "main is already at $current (>= $VERSION); skipping stamp."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Leaves antora.yml modified in the worktree; create-pull-request below
+          # is what commits it. stamp-antora fails loudly if it cannot stamp, so a
+          # no-op here means "already correct", never "silently did nothing".
+          make stamp-antora VERSION_brs="$VERSION" DATE="$DATE"
+
+          if git diff --quiet -- antora.yml; then
+            echo "antora.yml already matches $VERSION; nothing to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open site version stamp PR
+        if: steps.stamp.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GHTOKEN || secrets.GITHUB_TOKEN }}
+          base: main
+          commit-message: 'chore(site): stamp Antora version ${{ needs.build.outputs.version }} to match PDF'
+          branch: gitbot/stamp-site-${{ needs.build.outputs.version }}
+          delete-branch: true
+          title: Stamp Antora site version ${{ needs.build.outputs.version }} to match released PDF
+          body: |
+            This PR was opened automatically by the `${{ needs.build.outputs.version }}` BRS spec release build.
+
+            The ARC Author Guide requires the published HTML site version to match
+            the submission PDF exactly. Antora reads a static `version:` from the
+            committed `antora.yml`, so a release has to stamp that file.
+
+            Released PDF version: `${{ needs.build.outputs.version }}` (${{ needs.build.outputs.date }})
+
+            **Until this merges, the site version lags the released PDF.** The
+            values come from `scripts/release-info.sh` -- the same source the PDF
+            build uses -- so this needs a merge, not an edit.
+          labels: |
+            site-version
+            automated
+          add-paths: |
+            antora.yml
