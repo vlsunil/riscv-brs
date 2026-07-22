@@ -45,22 +45,6 @@ parse_version() {
   echo "$major" "$minor" "$patch"
 }
 
-version_ge() {
-  local a1 b1 c1 a2 b2 c2
-  read -r a1 b1 c1 <<<"$(parse_version "$1")"
-  read -r a2 b2 c2 <<<"$(parse_version "$2")"
-  if (( a1 > a2 )); then
-    return 0
-  fi
-  if (( a1 == a2 && b1 > b2 )); then
-    return 0
-  fi
-  if (( a1 == a2 && b1 == b2 && c1 >= c2 )); then
-    return 0
-  fi
-  return 1
-}
-
 next_version() {
   local major minor patch
   read -r major minor patch <<<"$(parse_version "$1")"
@@ -130,19 +114,25 @@ phase_for_version() {
     return 0
   fi
 
-  # Canonical RISC-V P&P milestone IDs. The version number encodes the
-  # milestone gate; see ARC_SUBMISSION.md.
-  if version_ge "$v" "v1.0.0"; then
+  local major minor patch
+  read -r major minor patch <<<"$(parse_version "$v")"
+
+  # Canonical RISC-V P&P milestone IDs. The MINOR.PATCH pair encodes the
+  # milestone gate within a development cycle; see ARC_SUBMISSION.md. A
+  # cycle is "ratified" once MINOR rolls back to 0 on a MAJOR bump (e.g.
+  # v1.0.0), so the same MINOR.PATCH gates (e.g. X.6.0) apply regardless
+  # of which MAJOR cycle is in progress.
+  if (( major >= 1 && minor == 0 )); then
     echo "ratified"
-  elif version_ge "$v" "v0.99.1"; then
+  elif (( minor >= 99 && patch >= 1 )); then
     echo "publication"
-  elif version_ge "$v" "v0.99.0"; then
+  elif (( minor >= 99 )); then
     echo "ratification-ready"
-  elif version_ge "$v" "v0.9.0"; then
+  elif (( minor >= 9 )); then
     echo "frozen"
-  elif version_ge "$v" "v0.8.0"; then
+  elif (( minor >= 8 )); then
     echo "stabilized"
-  elif version_ge "$v" "v0.6.0"; then
+  elif (( minor >= 6 )); then
     echo "development-complete"
   else
     echo "draft-and-development"
